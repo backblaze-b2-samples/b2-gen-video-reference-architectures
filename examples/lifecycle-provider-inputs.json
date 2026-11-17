@@ -1,0 +1,8 @@
+[
+  {
+    "fileNamePrefix": "inputs/",
+    "daysFromUploadingToHiding": 1,
+    "daysFromHidingToDeleting": 1,
+    "daysFromStartingToCancelingUnfinishedLargeFiles": 1
+  }
+]

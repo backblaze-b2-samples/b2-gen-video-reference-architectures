@@ -1,0 +1,10 @@
+[
+  {
+    "corsRuleName": "player-and-review-ui",
+    "allowedOrigins": ["https://player.example.com"],
+    "allowedOperations": ["s3_get", "s3_head"],
+    "allowedHeaders": ["range"],
+    "exposeHeaders": ["ETag", "Content-Length", "Content-Range"],
+    "maxAgeSeconds": 3600
+  }
+]

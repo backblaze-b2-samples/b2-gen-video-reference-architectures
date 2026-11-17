@@ -1,0 +1,6 @@
+{
+  "b2_create_bucket": {"fileLockEnabled": true},
+  "b2_update_bucket": {
+    "defaultRetention": {"mode": "governance", "period": {"duration": 365, "unit": "days"}}
+  }
+}

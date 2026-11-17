@@ -1,0 +1,661 @@
+schema_version: 2.0.0
+updated: "2026-11-16"
+canonical_documentation: https://www.backblaze.com/docs/cloud-storage-ai-machine-learning
+related_categories:
+  - name: AI Data Providers
+    url: https://github.com/backblaze-b2-samples/b2-ai-data-provider-reference-architectures
+  - name: Image Generation
+    url: https://github.com/backblaze-b2-samples/b2-image-generation-reference-architectures
+  - name: Robotics
+    url: https://github.com/backblaze-b2-samples/b2-robotics-reference-architectures
+  - name: Autonomous Vehicles
+    url: https://github.com/backblaze-b2-samples/b2-autonomous-vehicle-reference-architectures
+  - name: Commercial Drones
+    url: https://github.com/backblaze-b2-samples/b2-commercial-drone-reference-architectures
+architectures:
+  - id: curate-video-training-corpus
+    name: Ingest licensed footage, then split, caption and curate a text-to-video training corpus
+    summary: Licensed source video lands in an immutable raw bucket; curation engines split, score, filter, dedupe and caption it over the S3 API and write clips, captions, scores and embeddings back under run-addressed prefixes so each dataset version traces to the run that produced it.
+    audience:
+      - Video model data engineering teams
+      - Dataset curation and licensing operations
+      - Security and storage architects
+    problem: Curating TB-PB of source footage into tens to hundreds of millions of clips is slow and costly when footage is copied to every GPU node per pass, and without an immutable raw tier and per-run lineage nobody can later show which footage a model was trained on.
+    workflow:
+      - Bulk-load source footage with rclone or video2dataset into a raw bucket with licence sidecars
+      - Store raw footage under write-once prefixes; apply Object Lock governance retention when required
+      - Run GPU curation (Cosmos Curator, Daft or Pixeltable) directly against the raw bucket
+      - Caption with a VLM and ASR, then write clips, keyframes, captions and score tables to a curated bucket by run ID
+      - Store clip embeddings in a Lance table for dedupe and semantic lookup
+      - Publish per-run stats, the recipe config and a dataset card that lists run IDs and thresholds
+    capabilities:
+      - S3-compatible API
+      - Object Lock (default governance retention) or versioning on a dedicated raw bucket
+      - Large-file multipart upload
+      - Scoped application keys (read-only on raw bucket, write on curated bucket)
+      - Lifecycle rules on scratch/ intermediates
+    integrations:
+      - id: rclone
+        name: rclone
+        role: Bulk seeding of raw footage from on-prem disks and other clouds
+        connection: Configure a `b2` remote with a scoped application key (native B2 API); the S3 backend with provider Other and endpoint https://s3.<region>.backblazeb2.com also works
+        connection_type: native-b2-option
+        url: https://rclone.org/
+        setup_url: https://rclone.org/b2/
+      - id: video2dataset
+        name: video2dataset
+        role: URL-list download, clipping and WebDataset/parquet shard writing
+        connection: Set output_folder to s3://<bucket>/<prefix> and configure the fsspec s3 endpoint_url under client_kwargs as https://s3.<region>.backblazeb2.com
+        connection_type: fsspec-s3
+        url: https://github.com/iejMac/video2dataset
+      - id: cosmos-curator
+        name: NVIDIA Cosmos Curator
+        role: GPU video splitting, filtering, captioning and dedupe pipelines
+        connection: Configure the B2 profile in ~/.aws/credentials with aws_access_key_id, aws_secret_access_key, region and endpoint_url = https://s3.<region>.backblazeb2.com; Cosmos Curator reads only that file, not ~/.aws/config
+        connection_type: s3-custom-endpoint
+        url: https://github.com/NVIDIA/cosmos-curator
+        setup_url: https://github.com/NVIDIA/cosmos-curator/blob/main/docs/client/end-user-guide.md
+      - id: daft
+        name: Daft
+        role: Distributed multimodal dataframe for decode, scoring and Parquet I/O
+        connection: Pass IOConfig(s3=S3Config(endpoint_url="https://s3.<region>.backblazeb2.com", region_name="<region>", key_id=..., access_key=...)) to reads and writes
+        connection_type: s3-custom-endpoint
+        url: https://www.daft.ai/
+        setup_url: https://docs.daft.ai/en/stable/api/config/
+      - id: pixeltable
+        name: Pixeltable
+        role: Multimodal tables with computed frame, caption and embedding columns
+        connection: Add a [b2] profile with the application key to ~/.aws/credentials, set b2_profile = "b2" in config.toml, and point media destinations at https://s3.<region>.backblazeb2.com/<bucket>/<prefix>/
+        connection_type: native-b2-option
+        url: https://pixeltable.com/
+        setup_url: https://docs.pixeltable.com/integrations/cloud-storage
+      - id: lancedb
+        name: LanceDB / Lance
+        role: Clip-embedding table for near-duplicate search and semantic lookup
+        connection: Use the pinned LanceDB 0.20.0 / pylance 0.23.2 connection profile in examples/lancedb.md, with the B2 endpoint, region and scoped credentials; serialize all table mutations through one writer service
+        connection_type: s3-custom-endpoint
+        url: https://lancedb.com/
+        setup_url: https://github.com/lance-format/lance/blob/v0.23.2/rust/lance-table/src/io/commit.rs
+    off_object_storage:
+      - URL frontier and download-status queue (Postgres, Redis or Spark state)
+      - Rights and licence database
+      - Ray or Slurm task state
+      - GPU-local decode scratch
+      - In-RAM FAISS index used during dedupe
+      - Run-tracking database
+    prerequisites:
+      - Separate private B2 buckets for raw footage and curated output (Object Lock is enabled per bucket, not per prefix)
+      - Prefix-scoped application keys per role (ingest writer, curation reader, curated writer)
+      - GPU compute in any cloud with network access to the B2 S3 endpoint
+      - A rights and licence record per source outside object storage
+    expected_scale:
+      profile: TB-PB of source footage, many millions of derived clips, highly parallel ranged reads during decode
+      notes: Standard B2 is the default; consider B2 Overdrive only after measurement shows sustained object-store throughput, not GPU decode, limits curation passes.
+    security_considerations:
+      - Give curation workers read-only keys on the raw bucket and write keys only on the curated bucket
+      - Keep the raw bucket under governance-mode Object Lock or versioning so curation bugs cannot destroy source footage
+      - Keep licence and consent sidecars next to media, and the authoritative rights record in a database
+      - Never embed keys in curation recipes or notebooks
+      - Keep a dedicated, audited takedown-admin key (bypassGovernance, deleteFiles, listFiles) for licence revocation and erasure; no runtime role holds it
+    compliance_considerations:
+      - Record licence, consent and source for every raw object before it enters curation
+      - Keep the run ID, recipe and filter thresholds with each dataset version for training-data disclosure requests
+      - Set retention from licence terms in governance mode so takedown, licence revocation and consent withdrawal (for example GDPR erasure) remain possible through the audited takedown-admin key; do not use compliance mode for personal data
+      - Trace takedowns to derived clips, captions, embeddings and shards through run IDs and rebuild the next dataset version
+    links:
+      architecture: architectures/curate-video-training-corpus/architecture.md
+
+  - id: stream-shards-train-video-diffusion
+    name: Stream video shards into distributed diffusion training and version checkpoints and LoRAs
+    summary: Curated clips or precomputed latents are packed into immutable versioned shards that stream from B2 into multi-node GPU training; checkpoints, LoRAs, samples and eval metrics return to B2 so preempted jobs resume, and approved weights are promoted to a model prefix for inference.
+    audience:
+      - Video model training and ML platform engineers
+      - GPU cluster operators across neoclouds
+      - Security and storage architects
+    problem: Video diffusion transformers train on tens to hundreds of TB of shards across many GPUs and emit multi-GB checkpoints, so the data and checkpoint tier must be reachable from any cluster, survive preemption, and record lineage from dataset version to released weights.
+    workflow:
+      - Pack clips or latents into WebDataset, MDS or LitData shards under a new versioned prefix with an index
+      - Benchmark shard size and dataloader worker count against B2 before a large run
+      - Stream shards into training with MosaicML Streaming, LitData or a WebDataset s3 opener
+      - Write checkpoints through Ray Train storage_path or Composer save_folder
+      - Log samples, metrics and LoRAs to MLflow or a ZenML artifact store, or as W&B reference artifacts
+      - Promote approved weights to the models bucket (download with a read-only checkpoint key, re-upload with the publisher key), then expire intermediate checkpoints by age
+    capabilities:
+      - S3-compatible API (concurrent ranged GETs)
+      - Large-file multipart upload for multi-GB checkpoints
+      - Lifecycle rules by prefix and age on checkpoints/
+      - Cross-bucket promotion by download and re-upload (one key cannot span both buckets)
+      - Object Lock on a separate release-weights bucket (optional)
+      - Scoped application keys (read-only shards for training, write on checkpoints/)
+    integrations:
+      - id: mosaicml-streaming
+        name: MosaicML Streaming
+        role: Deterministic, resumable shard streaming into distributed training
+        connection: Set S3_ENDPOINT_URL to https://s3.<region>.backblazeb2.com and the application key as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+        connection_type: s3-custom-endpoint
+        url: https://github.com/mosaicml/streaming
+        setup_url: https://docs.mosaicml.com/projects/streaming/en/stable/how_to_guides/configure_cloud_storage_credentials.html
+      - id: litdata
+        name: Lightning LitData
+        role: Chunk optimization and streaming of training data
+        connection: Pass storage_options with S3_ENDPOINT_URL (or the boto3 endpoint_url) set to https://s3.<region>.backblazeb2.com to both optimize and StreamingDataset
+        connection_type: s3-custom-endpoint
+        url: https://github.com/Lightning-AI/litData
+      - id: ray-train
+        name: Ray Train
+        role: Distributed training orchestration and checkpoint persistence
+        connection: Set storage_path to s3://<bucket>/<path>?endpoint_override=https://s3.<region>.backblazeb2.com, or set AWS_ENDPOINT_URL_S3 with the application key in AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, per the guide's Backblaze B2 section
+        connection_type: s3-custom-endpoint
+        url: https://docs.ray.io/
+        setup_url: https://docs.ray.io/en/latest/train/user-guides/persistent-storage.html
+      - id: composer
+        name: MosaicML Composer checkpointing
+        role: Remote checkpoint save and resume
+        connection: Set S3_ENDPOINT_URL to https://s3.<region>.backblazeb2.com and use s3:// save_folder and load_path; Composer writes locally, uploads, and resumes from B2
+        connection_type: s3-custom-endpoint
+        url: https://docs.mosaicml.com/projects/composer/en/stable/trainer/checkpointing.html
+      - id: mlflow
+        name: MLflow
+        role: Experiment tracking with sample clips, metrics and LoRA artifacts
+        connection: Set the artifact root to b2://<bucket>@s3.<region>.backblazeb2.com/<path> with the application key in AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY and AWS_DEFAULT_REGION=<region>; s3:// with MLFLOW_S3_ENDPOINT_URL also works
+        connection_type: native-b2-option
+        url: https://mlflow.org/
+        setup_url: https://mlflow.org/docs/latest/self-hosting/architecture/artifact-store/
+      - id: zenml
+        name: ZenML
+        role: Pipeline artifact store for training runs, samples and evaluation outputs
+        connection: Run zenml integration install b2 and register an artifact store with --flavor=b2, an s3:// path and client_kwargs endpoint_url for the bucket region; credentials come from B2_APPLICATION_KEY_ID / B2_APPLICATION_KEY or a ZenML secret
+        connection_type: native-b2-option
+        url: https://www.zenml.io/
+        setup_url: https://docs.zenml.io/stacks/stack-components/artifact-stores/b2
+      - id: wandb
+        name: Weights & Biases reference artifacts
+        role: Lineage tracking of shards and checkpoints without copying bytes
+        connection: Set AWS_S3_ENDPOINT_URL to https://s3.<region>.backblazeb2.com and log s3:// reference artifacts; the reference-artifact docs list Backblaze B2 with this endpoint
+        connection_type: s3-custom-endpoint
+        url: https://wandb.ai/
+        setup_url: https://docs.coreweave.com/guides/artifacts/track-external-files/
+    off_object_storage:
+      - Node-local NVMe shard cache and dataloader shuffle buffers
+      - In-memory checkpoint staging and NCCL state
+      - Experiment-tracking backend database (MLflow or W&B metadata)
+      - Scheduler and job queue
+      - Dataset registry database that maps versions to runs
+    prerequisites:
+      - A private dataset bucket with versioned shard prefixes, and a checkpoint bucket or prefix
+      - Read-only shard keys for training jobs and write keys scoped to checkpoints/
+      - Node-local NVMe for shard caching on every training node
+      - A promotion step that re-uploads keepers to the models bucket before checkpoint lifecycle expiry
+    expected_scale:
+      profile: Tens to hundreds of TB of shards read concurrently by many GPU workers; multi-GB checkpoints written on a fixed cadence
+      notes: Benchmark shard size and worker count against B2 first. Standard B2 is the default; B2 Overdrive may apply when sustained multi-node read throughput is the measured bottleneck.
+    security_considerations:
+      - Training jobs get read-only keys on dataset shards; only checkpoint writers can write checkpoints/
+      - Keep promotion behind a publisher that holds a read-only checkpoint key and a write key on the release-weights bucket; never an unrestricted key
+      - Pass credentials to GPU clusters through the cluster's secret store, never in job specs or logs
+    compliance_considerations:
+      - Record the dataset version and shard index each run trained on, alongside the checkpoint
+      - Retain released weights and their lineage for model disclosure obligations
+    links:
+      architecture: architectures/stream-shards-train-video-diffusion/architecture.md
+
+  - id: self-hosted-video-diffusion-farm
+    name: Run a self-hosted open-weight video diffusion farm with shared weights and outputs
+    summary: Ephemeral ComfyUI GPU workers pull shared video diffusion checkpoints, VAEs and LoRAs from a model bucket with ETag-validated caching, render clips, and save outputs with the workflow JSON and seed to a generation prefix, returning presigned sharing URLs.
+    audience:
+      - Generative media platform engineers
+      - Creative studios running open-weight models
+      - GPU fleet operators
+    problem: Video diffusion weights run 5-30+ GB per checkpoint and GPU workers are ephemeral across clouds, so re-downloading from the Hugging Face Hub on every cold start wastes GPU time and outputs on worker disk vanish with the instance.
+    workflow:
+      - Mirror the Hugging Face cache into models/hf-cache/ with hf-cache-sync
+      - Store custom checkpoints, LoRAs and VAEs under models/{family}/{version}/
+      - Version ComfyUI workflow graphs under workflows/ and inputs under inputs/
+      - Render and save outputs with workflow JSON and seed to renders/
+      - Share outputs through time-limited presigned GET URLs and expire scratch/ by lifecycle
+    capabilities:
+      - S3-compatible API
+      - ETag on HEAD for client-side cache validation
+      - Presigned GET URLs for sharing outputs
+      - Lifecycle rules on scratch/
+      - Scoped application keys (read-only models/ for workers, write on renders/)
+    integrations:
+      - id: comfyui-cloud-storage
+        name: ComfyUI Cloud Storage nodes
+        role: Save video, load image and audio inputs (no video load node), download models with ETag cache, presigned share URLs inside ComfyUI
+        connection: Built-in Backblaze B2 provider preset via COMFY_S3_PROVIDER and COMFY_S3_REGION; COMFY_S3_ENDPOINT_URL overrides
+        connection_type: native-b2-option
+        url: https://github.com/backblaze-labs/comfyui-cloud-storage
+      - id: hf-cache-sync
+        name: HF Cache Sync
+        role: Mirror the Hugging Face hub cache to B2 for worker cold starts
+        connection: Set B2_ENDPOINT, B2_BUCKET, B2_REGION, B2_APPLICATION_KEY_ID and B2_APPLICATION_KEY (or storage.* in .hf-cache-sync.yaml); hf-cache-sync doctor shows which source it used
+        connection_type: native-b2-option
+        url: https://github.com/backblaze-labs/hf-cache-sync
+    off_object_storage:
+      - Hot weights in GPU VRAM and on worker NVMe
+      - Job queue (Redis, SQS or Temporal)
+      - User, session and billing database
+      - Worker scratch frames during a render
+    prerequisites:
+      - A private model bucket and a private outputs bucket, or prefixes with separate keys
+      - Read-only model keys on workers and write keys scoped to renders/
+      - Worker NVMe large enough for the active model set
+    expected_scale:
+      profile: Few large weight objects read on every cold start; many small-to-medium video outputs written per job
+      notes: ETag-validated local caching avoids repeat downloads; Standard B2 is the default and Overdrive is unlikely to matter unless a large fleet cold-starts at once.
+    security_considerations:
+      - Workers hold read-only keys on models/ and write-only-where-needed keys on renders/
+      - Treat presigned share URLs as bearer credentials with short expiry
+      - Review custom ComfyUI nodes before they run with storage credentials in the environment
+    compliance_considerations:
+      - Keep model licences next to weights and honour open-weight licence terms for hosted use
+      - Store workflow JSON and seed with every output so a render can be reproduced or disclosed
+    links:
+      architecture: architectures/self-hosted-video-diffusion-farm/architecture.md
+
+  - id: hosted-multi-provider-generation-provenance
+    name: Generate video across hosted model APIs and keep every output with a provenance manifest
+    summary: A prompt becomes a storyboard and keyframes that fan out to hosted text-to-video and image-to-video APIs; every intermediate and final asset is copied into B2 before the provider URL expires, with a per-run manifest of SHA-256 hashes, provider, model, prompt, params, seed and parent_run_id.
+    audience:
+      - Generative media application developers
+      - Teams comparing hosted video model providers
+      - Trust, safety and legal reviewers
+    problem: Hosted video APIs return expiring result URLs and charge per generation, so a lost take costs another generation; provider comparison, disclosure and takedown all need a provider-neutral, unchanged record of what produced each asset.
+    workflow:
+      - Upload references to inputs/ with an explicit Content-Type; relay them to upload APIs (Runway) or hand them over as short-lived presigned GET URLs (Replicate)
+      - Application workers orchestrate storyboard, keyframes, image-to-video, TTS and music through the chosen providers
+      - Sink outputs to runs/{tenant}/{date}/{run_id}/ as soon as each provider returns them (Replicate keeps API outputs for one hour by default)
+      - Store the run manifest with outputs and parent_run_id for linked pipelines
+      - A separate audit publisher copies approved manifests to an Object Lock bucket where retention must be provable
+      - Replay or fork runs from manifests and review takes through presigned URLs
+    capabilities:
+      - S3-compatible API
+      - Object Lock and legal hold on a dedicated manifest bucket
+      - Presigned GET URLs for provider input handoff and review
+      - Content-addressed keys (SHA-256)
+      - Scoped application keys (bucket-restricted, read/write only)
+    integrations:
+      - id: runway-api
+        name: Runway API
+        role: Hosted text-to-video and image-to-video generation
+        connection: Relay inputs from B2 through Runway's upload API (POST /v1/uploads, 512 bytes to 200 MB, runway:// URI valid 24 h), then copy generation outputs into B2 with a provenance manifest. Alternatively supply a public or CDN input URL that answers HEAD; a presigned GET URL is signed for GET only
+        connection_type: application-worker
+        url: https://docs.dev.runwayml.com/
+        setup_url: https://docs.dev.runwayml.com/assets/uploads/
+      - id: replicate
+        name: Replicate
+        role: Hosted open-model video generation
+        connection: Pass a B2 presigned GET URL as the file input; copy outputs into B2 within one hour, because Replicate deletes API outputs after that by default
+        connection_type: presigned-url
+        url: https://replicate.com/
+        setup_url: https://replicate.com/docs/topics/predictions/input-files
+    off_object_storage:
+      - Provider API keys (secrets manager)
+      - Job queue
+      - User, tenant and billing database
+      - Search index over manifest metadata
+      - C2PA or manifest signing keys (KMS or HSM)
+    prerequisites:
+      - A private generation bucket and, where retention must be provable, a separate Object Lock manifest bucket
+      - Provider API keys in a secrets manager
+      - A signer-only presigning key scoped to inputs/
+    expected_scale:
+      profile: Many short generation runs, each producing tens of small-to-medium assets plus one manifest
+      notes: Throughput is bounded by provider latency, not storage; Standard B2 fits and Overdrive does not apply.
+    security_considerations:
+      - Presigned input URLs are bearer credentials; keep expiry to the provider's fetch window
+      - Store bucket, key and sha256 in manifests and presign at read time; a private bucket's raw asset URL does not resolve for readers
+      - Keep provider API keys out of manifests and run metadata
+      - A hash manifest alone does not prove integrity against a writer; add a signature or C2PA Content Credentials where adversarial verification matters
+    compliance_considerations:
+      - Retain prompt, model, provider and seed per output for AI-content disclosure and takedown requests
+      - Use legal hold on disputed runs; choose compliance mode only for a contractual requirement
+      - Honour each provider's terms on output ownership and storage
+    links:
+      architecture: architectures/hosted-multi-provider-generation-provenance/architecture.md
+
+  - id: moderate-review-approve-generated-video
+    name: Moderate, review and approve generated video before it is published
+    summary: New clips land in a staging prefix; a B2 Event Notification triggers safety classification and a manifest hash check, editors review in a MAM connected to the same bucket, approved masters are copied to a published location, flagged assets move to quarantine, and disputed assets go under legal hold.
+    audience:
+      - Trust and safety engineering teams
+      - Post-production and MAM administrators
+      - Legal and compliance reviewers
+    problem: Generated video must pass policy, brand and legal checks before release, and copying it between moderation systems, MAM tools and archives creates divergent copies that break the audit trail disclosure and takedown requests depend on.
+    workflow:
+      - Generators write to inbox/staging/; a B2 Event Notification posts a signed webhook to an event broker
+      - A moderation worker samples and classifies frames, writes reports to inbox/moderation/ and moves violations to inbox/quarantine/
+      - A verifier recomputes SHA-256 and compares it with the run manifest
+      - Editors review passing assets in iconik with proxies built from a bucket scan
+      - Approved masters are server-side copied to published/ and the staging copy is hidden; disputed assets get a legal hold
+    capabilities:
+      - Event Notifications (signed webhooks on object events; enabled through Support)
+      - Object Lock and legal hold (Object Lock-enabled bucket)
+      - Server-side copy for staging-to-published promotion
+      - Lifecycle rule that deletes only hidden inbox/staging/ versions
+      - Private buckets with scoped application keys per stage
+      - Presigned GET URLs for reviewer access
+    integrations:
+      - id: iconik
+        name: iconik (Backlight)
+        role: Media asset management, proxies and editorial review
+        connection: Native "Backblaze B2" storage type configured with keyID, applicationKey, bucket name, bucket ID and path; enable Scan to generate proxies. One storage per prefix-scoped key (inbox/staging/, published/)
+        connection_type: native-b2-option
+        url: https://www.iconik.io/
+        setup_url: https://www.backblaze.com/docs/cloud-storage-integrate-iconik-with-backblaze-b2
+      - id: editshare-flow
+        name: EditShare FLOW
+        role: Media asset management and review for editorial teams
+        connection: Native "Backblaze" storage type configured with keyID, applicationKey and bucket name
+        connection_type: native-b2-option
+        url: https://www.editshare.com/
+        setup_url: https://www.backblaze.com/docs/cloud-storage-integrate-editshare-flow-with-backblaze-b2
+    off_object_storage:
+      - Moderation review queue and reviewer database
+      - MAM metadata databases (iconik, FLOW)
+      - Takedown ticketing
+      - Signing keys
+      - Event broker subscriber registry
+    prerequisites:
+      - An Object Lock-enabled bucket for staging, published and quarantine prefixes if legal hold is required
+      - Event Notifications enabled on the account by Backblaze Support
+      - An HTTPS webhook receiver that verifies signatures and acknowledges quickly
+      - Per-stage scoped keys (generator writer, moderator on inbox/, one MAM key per prefix, publisher without deleteFiles)
+    expected_scale:
+      profile: Event-driven, per-asset processing; moderation compute scales with generation volume
+      notes: Storage throughput is rarely the bottleneck; Standard B2 fits.
+    security_considerations:
+      - Verify the event signature and treat delivery as at-least-once; make handlers idempotent
+      - Scope the moderator key to inbox/ so it cannot delete published/; give the MAM read-only keys per prefix, never the publisher key
+      - Keep quarantined assets in a private prefix no public or CDN path can reach
+      - Never apply an age-based hide rule to inbox/staging/; delete only hidden versions
+    compliance_considerations:
+      - Keep moderation reports with the asset ID for audit and appeal
+      - Use legal hold for disputed assets; release holds only through an audited process
+      - Align takedown deletion with any active Object Lock retention
+    links:
+      architecture: architectures/moderate-review-approve-generated-video/architecture.md
+
+  - id: finish-package-deliver-generated-video
+    name: Finish, transcode and deliver generated video through a CDN
+    summary: Approved generations get finishing passes (upscale, interpolation, matting, captions, cutdowns) recorded in job manifests, are transcoded to HLS ladders, posters and WebVTT, and are served from B2 through a CDN partner or a signing edge app; managed video platforms ingest masters from presigned URLs.
+    audience:
+      - Generative media product engineers
+      - Video delivery and streaming engineers
+      - FinOps and storage architects
+    problem: Many gen-video models emit short, low-resolution, low-frame-rate clips that need finishing, and each master fans out into renditions with heavy read traffic, so egress fees and duplicate copies across render, transcode and CDN tiers dominate cost.
+    workflow:
+      - Run finishing jobs that write scratch frames and renders with JSON job manifests
+      - Transcode masters into HLS renditions, posters, sprites and WebVTT with ffmpeg or Telestream Vantage
+      - Serve delivery/ through Cloudflare, Fastly or bunny.net with Cache-Control set in bucket info
+      - Hand masters to Mux with a presigned GET URL when managed playback is used
+      - Expire scratch and intermediates by lifecycle; keep masters and only the latest version of each rendition
+    capabilities:
+      - S3-compatible API
+      - Public or private buckets as CDN origin
+      - Free egress to CDN partners (Cloudflare, Fastly, bunny.net)
+      - Presigned GET URLs
+      - Lifecycle rules on scratch/ and intermediates, plus keep-latest on delivery/ (B2 keeps prior versions by default)
+      - Bucket info Cache-Control headers
+    integrations:
+      - id: cloudflare
+        name: Cloudflare CDN / Workers
+        role: CDN delivery and request signing at the edge
+        connection: Public bucket as origin, or a Worker that signs requests to a private bucket with a scoped B2 application key
+        connection_type: cdn-origin
+        url: https://www.cloudflare.com/
+        setup_url: https://www.backblaze.com/docs/cloud-storage-deliver-private-backblaze-b2-content-through-cloudflare-cdn
+      - id: bunny-net
+        name: bunny.net CDN
+        role: Pull-zone CDN delivery
+        connection: Pull-zone origin is the B2 S3 endpoint; S3 Authentication with a keyID and applicationKey for private buckets
+        connection_type: cdn-origin
+        url: https://bunny.net/
+        setup_url: https://www.backblaze.com/docs/cloud-storage-integrate-bunnynet-with-backblaze-b2
+      - id: fastly
+        name: Fastly
+        role: CDN delivery with Compute request signing
+        connection: B2 S3 endpoint as origin; a Compute app signs requests to private buckets
+        connection_type: cdn-origin
+        url: https://www.fastly.com/
+        setup_url: https://www.backblaze.com/docs/cloud-storage-integrate-fastly-cdn-with-backblaze-b2
+      - id: telestream-vantage
+        name: Telestream Vantage Gateway
+        role: Enterprise transcode and packaging
+        connection: Source and destination use the NETAPP option with the B2 key ID, application key, S3 endpoint URL and bucket/path
+        connection_type: s3-custom-endpoint
+        url: https://www.telestream.net/
+        setup_url: https://www.backblaze.com/docs/cloud-storage-integrate-vantage-gateway-with-backblaze-b2
+      - id: mux
+        name: Mux Video
+        role: Managed encoding and playback
+        connection: Pass a B2 presigned GET URL for the master as inputs[].url, with an expiry that covers Mux's download
+        connection_type: presigned-url
+        url: https://www.mux.com/
+        setup_url: https://www.mux.com/docs/api-reference/video/assets/create-asset
+    off_object_storage:
+      - CDN edge cache
+      - Player analytics
+      - Entitlement and auth service
+      - Transcode and finishing job queue
+      - Mux-hosted renditions when Mux handles playback
+    prerequisites:
+      - A delivery bucket (public, or private behind a signing edge app) separate from masters
+      - A CDN account with B2 configured as origin
+      - Read-only, prefix-scoped key for the edge signer
+    expected_scale:
+      profile: Read-heavy delivery with many renditions per master; bursty finishing and transcode writes
+      notes: CDN caching absorbs hot reads; Standard B2 is the origin default.
+    security_considerations:
+      - Prefer a private bucket behind a signing edge app; a public bucket exposes every object by URL
+      - Edge signer key is read-only and scoped to delivery/
+      - Presigned master URLs for Mux are bearer credentials; expire them after ingest
+    compliance_considerations:
+      - Carry provenance or Content Credentials through finishing so delivered renditions stay traceable to the source run
+      - Remove delivery renditions and purge CDN caches on takedown
+    links:
+      architecture: architectures/finish-package-deliver-generated-video/architecture.md
+
+samples:
+  - id: genblaze
+    name: Genblaze SDK
+    url: https://github.com/backblaze-labs/genblaze
+    group: building-block
+    summary: Multi-provider generative media pipeline SDK that saves outputs and SHA-256 provenance manifests to B2.
+    architectures: [hosted-multi-provider-generation-provenance, moderate-review-approve-generated-video]
+
+  - id: genblaze-gmicloud-pipeline
+    name: Genblaze x GMICloud image-to-video pipeline
+    url: https://github.com/backblaze-labs/genblaze-gmicloud-pipeline
+    group: workflow
+    summary: Generates an anchor image from a prompt, fans it out to several hosted image-to-video models, and writes every artifact plus a manifest to B2.
+    architectures: [hosted-multi-provider-generation-provenance]
+
+  - id: genblaze-gen-media-multi-provider-sample
+    name: Genblaze multi-provider gen-media sample
+    url: https://github.com/backblaze-labs/genblaze-gen-media-multi-provider-sample
+    group: workflow
+    summary: Builds a captioned explainer from one prompt (storyboard, keyframes, image-to-video, TTS, music, ffmpeg compose) with parent_run_id lineage on B2.
+    architectures: [hosted-multi-provider-generation-provenance]
+
+  - id: nvidia-nemotron-genblaze-b2
+    name: NVIDIA Nemotron x Genblaze
+    url: https://github.com/backblaze-labs/nvidia-nemotron-genblaze-b2
+    group: workflow
+    summary: Turns uploaded media into a briefing, then generates images, speech, music and Cosmos video, all stored under run-ID prefixes in B2.
+    architectures: [hosted-multi-provider-generation-provenance]
+
+  - id: ai-avatar-video-generator
+    name: AI Avatar Video Generator
+    url: https://github.com/backblaze-b2-samples/ai-avatar-video-generator
+    group: workflow
+    summary: Generates talking-head video through a hosted API and archives each take to B2 before the provider URL expires.
+    architectures: [hosted-multi-provider-generation-provenance]
+
+  - id: comic-storyboard-b2
+    name: Comic Storyboard
+    url: https://github.com/backblaze-b2-samples/comic-storyboard-b2
+    group: building-block
+    summary: Generates character-consistent storyboard frames with per-frame SHA-256 manifests on B2, comparable to the keyframe stage before image-to-video.
+    architectures: [hosted-multi-provider-generation-provenance]
+
+  - id: comfyui-cloud-storage
+    name: ComfyUI Cloud Storage nodes
+    url: https://github.com/backblaze-labs/comfyui-cloud-storage
+    group: building-block
+    summary: ComfyUI nodes with a Backblaze B2 preset that save video, load inputs, download models with an ETag cache, and generate presigned share URLs.
+    architectures: [self-hosted-video-diffusion-farm]
+
+  - id: hf-cache-sync
+    name: HF Cache Sync
+    url: https://github.com/backblaze-labs/hf-cache-sync
+    group: building-block
+    summary: Syncs the Hugging Face hub cache to B2 so GPU nodes fetch large weights from B2 instead of the Hub.
+    architectures: [self-hosted-video-diffusion-farm]
+
+  - id: data-juicer-multimodal-curation
+    name: Data-Juicer Multimodal Curation
+    url: https://github.com/backblaze-b2-samples/data-juicer-multimodal-curation
+    group: workflow
+    summary: Runs Data-Juicer recipes over raw shards and writes refined datasets, stats and configs back to B2; B2 I/O lives in the sample's app layer, not in Data-Juicer.
+    architectures: [curate-video-training-corpus]
+
+  - id: videohash-deduplication
+    name: Videohash Deduplication
+    url: https://github.com/backblaze-b2-samples/videohash-deduplication
+    group: building-block
+    summary: Perceptually hashes a video library on B2 and clusters near-duplicates.
+    architectures: [curate-video-training-corpus]
+
+  - id: clip-video-scene-search
+    name: CLIP Video Scene Search
+    url: https://github.com/backblaze-b2-samples/clip-video-scene-search
+    group: building-block
+    summary: Splits scenes with PySceneDetect, extracts keyframes, embeds them with OpenCLIP and builds an index, all persisted to B2.
+    architectures: [curate-video-training-corpus]
+
+  - id: qwen-video-chapters
+    name: Qwen Video Chapters
+    url: https://github.com/backblaze-b2-samples/qwen-video-chapters
+    group: building-block
+    summary: Runs a local Qwen2.5-VL model on keyframes and writes captions and summaries back to B2.
+    architectures: [curate-video-training-corpus]
+
+  - id: b2-pixeltable-multimodal-data
+    name: Pixeltable multimodal data notebooks
+    url: https://github.com/backblaze-b2-samples/b2-pixeltable-multimodal-data
+    group: building-block
+    summary: Notebooks that use Pixeltable with media stored in B2 for frame extraction and multimodal tables.
+    architectures: [curate-video-training-corpus]
+
+  - id: nudenet-video-moderation
+    name: NudeNet Video Moderation
+    url: https://github.com/backblaze-b2-samples/nudenet-video-moderation
+    group: workflow
+    summary: Classifies sampled frames and writes flagged crops, reports and a violations manifest to B2, with a human review queue.
+    architectures: [moderate-review-approve-generated-video, curate-video-training-corpus]
+
+  - id: whisper-subtitle-pipeline
+    name: Whisper Subtitle Pipeline
+    url: https://github.com/backblaze-b2-samples/whisper-subtitle-pipeline
+    group: building-block
+    summary: Generates multilingual captions with faster-whisper and NLLB and stores them next to the source videos in B2.
+    architectures: [finish-package-deliver-generated-video, curate-video-training-corpus]
+
+  - id: webdataset-streaming-pytorch-training
+    name: WebDataset Streaming PyTorch Training
+    url: https://github.com/backblaze-b2-samples/webdataset-streaming-pytorch-training
+    group: building-block
+    summary: Streams tar shards from B2 into a PyTorch IterableDataset, split across nodes and workers.
+    architectures: [stream-shards-train-video-diffusion]
+
+  - id: lora-training-studio
+    name: LoRA Training Studio
+    url: https://github.com/backblaze-b2-samples/lora-training-studio
+    group: building-block
+    summary: Image LoRA training with Diffusers, with dataset, captions, checkpoints and safetensors versioned on B2; demonstrates the dataset and checkpoint storage layout used by the video-training architecture.
+    architectures: [stream-shards-train-video-diffusion]
+
+  - id: ai-video-upscaler-restore
+    name: AI Video Upscaler & Restore
+    url: https://github.com/backblaze-b2-samples/ai-video-upscaler-restore
+    group: building-block
+    summary: Real-ESRGAN/GFPGAN upscaling and restoration, with sources and outputs kept side by side on B2.
+    architectures: [finish-package-deliver-generated-video]
+
+  - id: rife-frame-interpolation-pipeline
+    name: RIFE Frame Interpolation Pipeline
+    url: https://github.com/backblaze-b2-samples/rife-frame-interpolation-pipeline
+    group: building-block
+    summary: 2x/4x/8x frame interpolation, with renders and manifests stored in B2.
+    architectures: [finish-package-deliver-generated-video]
+
+  - id: remotion-promo-video-pipeline
+    name: Remotion Promo Video Pipeline
+    url: https://github.com/backblaze-b2-samples/remotion-promo-video-pipeline
+    group: workflow
+    summary: Programmatic composition that stores storyboards, frames, MP4 cutdowns and manifests on B2, a pattern for assembling generated clips into per-platform cutdowns.
+    architectures: [finish-package-deliver-generated-video]
+
+  - id: ai-shorts-generator
+    name: AI Shorts Generator
+    url: https://github.com/backblaze-b2-samples/ai-shorts-generator
+    group: workflow
+    summary: Turns one long video into 9:16 clips with burned-in captions (Whisper transcript, LLM moment selection, ffmpeg render), storing every source, transcript and clip on B2; a pattern for per-platform cutdowns of finished masters.
+    architectures: [finish-package-deliver-generated-video]
+
+  - id: ffmpeg-hls-vod-transcoder
+    name: FFmpeg HLS VOD Transcoder
+    url: https://github.com/backblaze-b2-samples/ffmpeg-hls-vod-transcoder
+    group: workflow
+    summary: Builds an HLS ladder plus thumbnail sprites and WebVTT on B2.
+    architectures: [finish-package-deliver-generated-video]
+
+  - id: cloudflare-b2
+    name: Cloudflare Worker for B2
+    url: https://github.com/backblaze-b2-samples/cloudflare-b2
+    group: building-block
+    summary: Worker that signs requests to a private B2 bucket so it can be served only through Cloudflare.
+    architectures: [finish-package-deliver-generated-video]
+
+  - id: fastly-b2-rust
+    name: Fastly Compute app for B2
+    url: https://github.com/backblaze-b2-samples/fastly-b2-rust
+    group: building-block
+    summary: Fastly Compute app that serves content from private B2 buckets.
+    architectures: [finish-package-deliver-generated-video]
+
+  - id: b2-transloadit-example
+    name: Transloadit + bunny.net video sharing example
+    url: https://github.com/backblaze-b2-samples/b2-transloadit-example
+    group: workflow
+    summary: Uploads through Transloadit transcoding into a private B2 bucket, with delivery by bunny.net.
+    architectures: [finish-package-deliver-generated-video]
+
+  - id: b2-event-broker
+    name: B2 Event Broker
+    url: https://github.com/backblaze-b2-samples/b2-event-broker
+    group: building-block
+    summary: Cloudflare Worker that validates signed B2 Event Notifications and fans them out to subscribers.
+    architectures: [moderate-review-approve-generated-video]
+
+  - id: backblaze-frameio
+    name: Frame.io custom action for B2
+    url: https://github.com/backblaze-b2-samples/backblaze-frameio
+    group: building-block
+    summary: Bridge container that exports and imports assets between Frame.io and B2 for review.
+    architectures: [moderate-review-approve-generated-video]
+
+  - id: awesome-video-generation
+    name: Awesome Video Generation
+    url: https://github.com/backblaze-labs/awesome-video-generation
+    group: domain
+    summary: Curated list of video generation APIs, open models, SDKs, infrastructure and evals.
+
+  - id: awesome-multimodal-data
+    name: Awesome Multimodal Data
+    url: https://github.com/backblaze-labs/awesome-multimodal-data
+    group: domain
+    summary: Curated list of multimodal datasets and data infrastructure (video, image, audio, 3D, robotics) with formats, loaders, versioning and labeling tools.
+    architectures: [curate-video-training-corpus]

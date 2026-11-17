@@ -1,0 +1,17 @@
+{
+  "bucketId": "<review-bucket-id>",
+  "eventNotificationRules": [
+    {
+      "name": "moderate-on-staging-upload",
+      "eventTypes": ["b2:ObjectCreated:Upload", "b2:ObjectCreated:MultipartUpload", "b2:ObjectCreated:Copy"],
+      "objectNamePrefix": "inbox/staging/",
+      "isEnabled": true,
+      "maxEventsPerBatch": 1,
+      "targetConfiguration": {
+        "targetType": "webhook",
+        "url": "https://hooks.example.com/b2/moderate",
+        "hmacSha256SigningSecret": "<32-char-alphanumeric-secret>"
+      }
+    }
+  ]
+}
